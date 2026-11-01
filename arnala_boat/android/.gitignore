@@ -1,0 +1,18 @@
+git check-ignore -v arnala_boat/android/gradlewgradle-wrapper.jar
+/.gradle
+/captures/
+/gradlew
+/gradlew.bat
+/local.properties
+GeneratedPluginRegistrant.java
+.cxx/
+
+# Remember to never publicly share your keystore.
+# See https://flutter.dev/to/reference-keystore
+key.properties
+**/*.keystore
+**/*.jks
+!gradle-wrapper.jar
+!/gradlew
+!/gradlew.bat
+arnala_boat/build/

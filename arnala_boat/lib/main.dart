@@ -44,8 +44,8 @@ class BoatTrackingScreen extends StatefulWidget {
 
 class _BoatTrackingScreenState extends State<BoatTrackingScreen>
     with TickerProviderStateMixin {
-  static const String apiBaseUrl =
-      'https://laughing-broccoli-jrrxjpgrxxjqc55vv-8000.app.github.dev';
+  static const String baseUrl =
+    "https://arnala-boat-location.onrender.com";
 
   static const LatLng fallbackLocation = LatLng(19.4550, 72.7500);
   static const LatLng arnalaJetty = LatLng(19.4622441, 72.7445625);

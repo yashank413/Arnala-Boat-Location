@@ -14,6 +14,8 @@ from pathlib import Path
 from decouple import config
 import os
 import dj_database_url
+import secrets
+from django.conf import settings
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -161,3 +163,4 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 CORS_ALLOWED_ORIGINS = [
     "https://arnala-boat-location-1.onrender.com",
 ]
+BOAT_DEVICE_TOKEN = os.environ.get("BOAT_DEVICE_TOKEN", "")

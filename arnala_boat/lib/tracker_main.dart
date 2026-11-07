@@ -7,9 +7,11 @@ import 'package:geolocator/geolocator.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
-const String apiBaseUrl = 'https://arnala-boat-location.onrender.com';
+const String apiBaseUrl =
+    'https://arnala-boat-location.onrender.com';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const BoatTrackerApp());
 }
 
@@ -48,6 +50,8 @@ class _TrackerScreenState extends State<TrackerScreen> {
 
   bool isTracking = false;
   bool isSending = false;
+  bool isStarting = false;
+
   String status = 'Not tracking';
   String uploadStatus = 'Waiting';
   String? deviceToken;
@@ -61,16 +65,23 @@ class _TrackerScreenState extends State<TrackerScreen> {
   }
 
   Future<void> loadToken() async {
-    final saved = await storage.read(key: 'boat_device_token');
+    try {
+      final saved =
+          await storage.read(key: 'boat_device_token');
 
-    if (!mounted) return;
+      if (!mounted) return;
 
-    setState(() {
-      deviceToken = saved;
-      if (saved != null && saved.isNotEmpty) {
-        tokenController.text = saved;
-      }
-    });
+      setState(() {
+        deviceToken = saved;
+
+        if (saved != null && saved.isNotEmpty) {
+          tokenController.text = saved;
+        }
+      });
+    } catch (error) {
+      if (!mounted) return;
+      showMessage('Could not load saved token: $error');
+    }
   }
 
   Future<void> saveToken() async {
@@ -81,82 +92,104 @@ class _TrackerScreenState extends State<TrackerScreen> {
       return;
     }
 
-    await storage.write(
-      key: 'boat_device_token',
-      value: value,
-    );
+    try {
+      await storage.write(
+        key: 'boat_device_token',
+        value: value,
+      );
 
-    if (!mounted) return;
+      if (!mounted) return;
 
-    setState(() {
-      deviceToken = value;
-      status = 'Device token saved';
-    });
+      setState(() {
+        deviceToken = value;
+        status = 'Device token saved';
+      });
 
-    showMessage('Private token saved securely.');
+      showMessage('Private token saved securely.');
+    } catch (error) {
+      showMessage('Could not save token: $error');
+    }
   }
 
   Future<bool> checkPermissions() async {
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    final serviceEnabled =
+        await Geolocator.isLocationServiceEnabled();
 
     if (!serviceEnabled) {
-      showMessage('Please enable GPS on your phone.');
+      showMessage('Please switch ON GPS on your phone.');
       await Geolocator.openLocationSettings();
       return false;
     }
 
-    LocationPermission permission = await Geolocator.checkPermission();
+    LocationPermission permission =
+        await Geolocator.checkPermission();
 
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
     }
 
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      showMessage('Location permission is required.');
+    if (permission == LocationPermission.denied) {
+      showMessage('Location permission was denied.');
       return false;
     }
 
-    if (permission == LocationPermission.whileInUse) {
+    if (permission == LocationPermission.deniedForever) {
       showMessage(
-        'For screen-off tracking, allow background location in Android settings.',
+        'Location permission is blocked. Enable it in App Settings.',
       );
       await Geolocator.openAppSettings();
       return false;
     }
 
+    if (permission == LocationPermission.unableToDetermine) {
+      showMessage('Unable to determine location permission.');
+      return false;
+    }
+
+    // Both whileInUse and always are accepted.
+    // Start tracking while the app is visible.
     return true;
   }
 
   Future<void> startTracking() async {
+    if (isStarting || isTracking) return;
+
     if (deviceToken == null || deviceToken!.isEmpty) {
       showMessage('Save your private device token first.');
       return;
     }
 
-    final permitted = await checkPermissions();
-
-    if (!permitted || !mounted) return;
-
-    final settings = AndroidSettings(
-      accuracy: LocationAccuracy.bestForNavigation,
-      distanceFilter: 0,
-      intervalDuration: Duration(seconds: 5),
-      foregroundNotificationConfig: ForegroundNotificationConfig(
-        notificationTitle: 'Arnala Boat Tracking Active',
-        notificationText: 'Your boat location is being shared.',
-        enableWakeLock: true,
-        setOngoing: true,
-      ),
-    );
-
     setState(() {
-      isTracking = true;
-      status = 'Starting GPS...';
-      uploadStatus = 'Waiting for GPS';
+      isStarting = true;
+      status = 'Checking GPS permission...';
     });
 
     try {
+      final permitted = await checkPermissions();
+
+      if (!permitted || !mounted) return;
+
+      final settings = AndroidSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0,
+        intervalDuration: const Duration(seconds: 5),
+        foregroundNotificationConfig:
+            ForegroundNotificationConfig(
+          notificationTitle: 'Arnala Boat Tracking Active',
+          notificationText:
+              'Your boat location is being shared.',
+          enableWakeLock: true,
+          setOngoing: true,
+        ),
+      );
+
+      setState(() {
+        isTracking = true;
+        status = 'Searching for GPS signal...';
+        uploadStatus = 'Waiting for first GPS position';
+      });
+
+      // Start continuous tracking.
       positionSubscription =
           Geolocator.getPositionStream(
         locationSettings: settings,
@@ -175,11 +208,42 @@ class _TrackerScreenState extends State<TrackerScreen> {
           if (!mounted) return;
 
           setState(() {
-            status = 'GPS error: $error';
+            status = 'GPS stream error: $error';
             isTracking = false;
           });
+
+          positionSubscription?.cancel();
+          positionSubscription = null;
         },
+        cancelOnError: true,
       );
+
+      // Request an immediate GPS fix as well.
+      try {
+        final firstPosition =
+            await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            timeLimit: Duration(seconds: 25),
+          ),
+        );
+
+        if (!mounted) return;
+
+        setState(() {
+          currentPosition = firstPosition;
+          status = 'GPS connected';
+        });
+
+        uploadLocation(firstPosition);
+      } on TimeoutException {
+        if (!mounted) return;
+
+        setState(() {
+          status = 'GPS signal is taking longer than expected';
+          uploadStatus = 'Still searching for GPS';
+        });
+      }
     } catch (error) {
       if (!mounted) return;
 
@@ -187,6 +251,15 @@ class _TrackerScreenState extends State<TrackerScreen> {
         isTracking = false;
         status = 'Could not start tracking: $error';
       });
+
+      await positionSubscription?.cancel();
+      positionSubscription = null;
+    } finally {
+      if (mounted) {
+        setState(() {
+          isStarting = false;
+        });
+      }
     }
   }
 
@@ -210,17 +283,14 @@ class _TrackerScreenState extends State<TrackerScreen> {
           )
           .timeout(const Duration(seconds: 15));
 
+      if (!mounted) return;
+
       if (response.statusCode == 201) {
-        successfulUploads++;
-
-        if (!mounted) return;
-
         setState(() {
+          successfulUploads++;
           uploadStatus = 'Location uploaded successfully';
         });
       } else {
-        if (!mounted) return;
-
         setState(() {
           uploadStatus =
               'Upload failed (${response.statusCode}): ${response.body}';
@@ -245,6 +315,7 @@ class _TrackerScreenState extends State<TrackerScreen> {
 
     setState(() {
       isTracking = false;
+      isStarting = false;
       status = 'Tracking stopped';
       uploadStatus = 'Stopped';
     });
@@ -267,10 +338,13 @@ class _TrackerScreenState extends State<TrackerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final position = currentPosition;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Arnala Boat Tracker'),
-        backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+        backgroundColor:
+            Theme.of(context).colorScheme.primaryContainer,
       ),
       body: ListView(
         padding: const EdgeInsets.all(20),
@@ -301,6 +375,7 @@ class _TrackerScreenState extends State<TrackerScreen> {
           TextField(
             controller: tokenController,
             obscureText: true,
+            enabled: !isTracking,
             decoration: const InputDecoration(
               border: OutlineInputBorder(),
               hintText: 'Enter your Render device token',
@@ -311,7 +386,7 @@ class _TrackerScreenState extends State<TrackerScreen> {
           const SizedBox(height: 10),
 
           OutlinedButton.icon(
-            onPressed: saveToken,
+            onPressed: isTracking ? null : saveToken,
             icon: const Icon(Icons.security),
             label: const Text('Save token securely'),
           ),
@@ -334,7 +409,9 @@ class _TrackerScreenState extends State<TrackerScreen> {
                   Icon(
                     isTracking ? Icons.gps_fixed : Icons.gps_off,
                     size: 42,
-                    color: isTracking ? Colors.green : Colors.grey,
+                    color: isTracking
+                        ? Colors.green
+                        : Colors.grey,
                   ),
                   const SizedBox(height: 8),
                   Text(
@@ -353,29 +430,37 @@ class _TrackerScreenState extends State<TrackerScreen> {
 
           const SizedBox(height: 16),
 
-          if (currentPosition != null) ...[
+          if (position != null)
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(16),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                  crossAxisAlignment:
+                      CrossAxisAlignment.start,
                   children: [
                     const Text(
                       'CURRENT GPS LOCATION',
-                      style: TextStyle(fontWeight: FontWeight.bold),
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     const SizedBox(height: 12),
-                    Text('Latitude: ${currentPosition!.latitude}'),
-                    Text('Longitude: ${currentPosition!.longitude}'),
-                    Text('Accuracy: ${currentPosition!.accuracy} metres'),
                     Text(
-                      'Speed: ${(currentPosition!.speed * 3.6).toStringAsFixed(1)} km/h',
+                      'Latitude: ${position.latitude}',
+                    ),
+                    Text(
+                      'Longitude: ${position.longitude}',
+                    ),
+                    Text(
+                      'Accuracy: ${position.accuracy.toStringAsFixed(1)} metres',
+                    ),
+                    Text(
+                      'Speed: ${(position.speed * 3.6).toStringAsFixed(1)} km/h',
                     ),
                   ],
                 ),
               ),
             ),
-          ],
 
           const SizedBox(height: 12),
 
@@ -387,9 +472,14 @@ class _TrackerScreenState extends State<TrackerScreen> {
           const SizedBox(height: 24),
 
           FilledButton.icon(
-            onPressed: isTracking ? null : startTracking,
+            onPressed:
+                (isTracking || isStarting) ? null : startTracking,
             icon: const Icon(Icons.play_arrow),
-            label: const Text('START BOAT TRACKING'),
+            label: Text(
+              isStarting
+                  ? 'STARTING...'
+                  : 'START BOAT TRACKING',
+            ),
             style: FilledButton.styleFrom(
               minimumSize: const Size(double.infinity, 55),
               backgroundColor: Colors.green,
@@ -411,7 +501,7 @@ class _TrackerScreenState extends State<TrackerScreen> {
           const SizedBox(height: 20),
 
           const Text(
-            'Keep GPS and mobile data enabled while the boat is operating.',
+            'Keep GPS and mobile data enabled while the boat is operating. Keep the tracking notification active.',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey),
           ),

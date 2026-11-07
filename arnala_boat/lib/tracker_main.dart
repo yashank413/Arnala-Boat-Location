@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
@@ -49,8 +50,8 @@ class _TrackerScreenState extends State<TrackerScreen> {
   Position? currentPosition;
 
   bool isTracking = false;
-  bool isSending = false;
   bool isStarting = false;
+  bool isSending = false;
 
   String status = 'Not tracking';
   String uploadStatus = 'Waiting';
@@ -79,8 +80,8 @@ class _TrackerScreenState extends State<TrackerScreen> {
         }
       });
     } catch (error) {
-      if (!mounted) return;
-      showMessage('Could not load saved token: $error');
+      debugPrint('TOKEN LOAD ERROR: $error');
+      showMessage('Could not load saved token.');
     }
   }
 
@@ -107,6 +108,7 @@ class _TrackerScreenState extends State<TrackerScreen> {
 
       showMessage('Private token saved securely.');
     } catch (error) {
+      debugPrint('TOKEN SAVE ERROR: $error');
       showMessage('Could not save token: $error');
     }
   }
@@ -115,8 +117,16 @@ class _TrackerScreenState extends State<TrackerScreen> {
     final serviceEnabled =
         await Geolocator.isLocationServiceEnabled();
 
+    debugPrint('GPS SERVICE ENABLED: $serviceEnabled');
+
     if (!serviceEnabled) {
-      showMessage('Please switch ON GPS on your phone.');
+      if (mounted) {
+        setState(() {
+          status = 'GPS is switched off';
+        });
+      }
+
+      showMessage('Switch on GPS/location on your phone.');
       await Geolocator.openLocationSettings();
       return false;
     }
@@ -124,30 +134,33 @@ class _TrackerScreenState extends State<TrackerScreen> {
     LocationPermission permission =
         await Geolocator.checkPermission();
 
+    debugPrint('CURRENT PERMISSION: $permission');
+
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
+      debugPrint('REQUESTED PERMISSION: $permission');
     }
 
-    if (permission == LocationPermission.denied) {
-      showMessage('Location permission was denied.');
-      return false;
-    }
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever ||
+        permission == LocationPermission.unableToDetermine) {
+      if (mounted) {
+        setState(() {
+          status = 'Location permission not granted';
+        });
+      }
 
-    if (permission == LocationPermission.deniedForever) {
       showMessage(
-        'Location permission is blocked. Enable it in App Settings.',
+        'Allow location permission in Android app settings.',
       );
-      await Geolocator.openAppSettings();
+
+      if (permission == LocationPermission.deniedForever) {
+        await Geolocator.openAppSettings();
+      }
+
       return false;
     }
 
-    if (permission == LocationPermission.unableToDetermine) {
-      showMessage('Unable to determine location permission.');
-      return false;
-    }
-
-    // Both whileInUse and always are accepted.
-    // Start tracking while the app is visible.
     return true;
   }
 
@@ -161,7 +174,8 @@ class _TrackerScreenState extends State<TrackerScreen> {
 
     setState(() {
       isStarting = true;
-      status = 'Checking GPS permission...';
+      status = 'Checking GPS permissions...';
+      uploadStatus = 'Preparing GPS';
     });
 
     try {
@@ -169,10 +183,12 @@ class _TrackerScreenState extends State<TrackerScreen> {
 
       if (!permitted || !mounted) return;
 
-      final settings = AndroidSettings(
+      // Android GPS configuration.
+      final gpsSettings = AndroidSettings(
         accuracy: LocationAccuracy.bestForNavigation,
         distanceFilter: 0,
         intervalDuration: const Duration(seconds: 5),
+        timeLimit: const Duration(seconds: 45),
         foregroundNotificationConfig:
             ForegroundNotificationConfig(
           notificationTitle: 'Arnala Boat Tracking Active',
@@ -184,17 +200,49 @@ class _TrackerScreenState extends State<TrackerScreen> {
       );
 
       setState(() {
-        isTracking = true;
         status = 'Searching for GPS signal...';
         uploadStatus = 'Waiting for first GPS position';
       });
 
-      // Start continuous tracking.
+      debugPrint('REQUESTING FIRST GPS POSITION...');
+
+      // Get an immediate GPS fix.
+      final firstPosition =
+          await Geolocator.getCurrentPosition(
+        locationSettings: gpsSettings,
+      );
+
+      debugPrint(
+        'FIRST GPS FIX: '
+        '${firstPosition.latitude}, '
+        '${firstPosition.longitude}',
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        currentPosition = firstPosition;
+        status = 'GPS connected';
+        isTracking = true;
+      });
+
+      // Upload first location.
+      await uploadLocation(firstPosition);
+
+      if (!mounted) return;
+
+      // Start continuous GPS tracking.
       positionSubscription =
           Geolocator.getPositionStream(
-        locationSettings: settings,
+        locationSettings: gpsSettings,
       ).listen(
         (Position position) {
+          debugPrint(
+            'GPS STREAM: '
+            '${position.latitude}, '
+            '${position.longitude}',
+          );
+
           if (!mounted) return;
 
           setState(() {
@@ -205,6 +253,8 @@ class _TrackerScreenState extends State<TrackerScreen> {
           uploadLocation(position);
         },
         onError: (error) {
+          debugPrint('GPS STREAM ERROR: $error');
+
           if (!mounted) return;
 
           setState(() {
@@ -215,45 +265,59 @@ class _TrackerScreenState extends State<TrackerScreen> {
           positionSubscription?.cancel();
           positionSubscription = null;
         },
+        onDone: () {
+          debugPrint('GPS STREAM CLOSED');
+
+          if (!mounted) return;
+
+          setState(() {
+            if (isTracking) {
+              status = 'GPS stream stopped';
+              isTracking = false;
+            }
+          });
+        },
         cancelOnError: true,
       );
 
-      // Request an immediate GPS fix as well.
-      try {
-        final firstPosition =
-            await Geolocator.getCurrentPosition(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            timeLimit: Duration(seconds: 25),
-          ),
-        );
+    } on TimeoutException catch (error) {
+      debugPrint('GPS TIMEOUT: $error');
 
-        if (!mounted) return;
-
-        setState(() {
-          currentPosition = firstPosition;
-          status = 'GPS connected';
-        });
-
-        uploadLocation(firstPosition);
-      } on TimeoutException {
-        if (!mounted) return;
-
-        setState(() {
-          status = 'GPS signal is taking longer than expected';
-          uploadStatus = 'Still searching for GPS';
-        });
-      }
-    } catch (error) {
       if (!mounted) return;
 
       setState(() {
+        status = 'GPS timeout - no position received';
+        uploadStatus = 'Try testing outdoors';
         isTracking = false;
-        status = 'Could not start tracking: $error';
       });
 
-      await positionSubscription?.cancel();
-      positionSubscription = null;
+    } on LocationServiceDisabledException {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Phone GPS is disabled';
+        isTracking = false;
+      });
+
+    } on PermissionDeniedException {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Location permission denied';
+        isTracking = false;
+      });
+
+    } catch (error, stackTrace) {
+      debugPrint('TRACKING ERROR: $error');
+      debugPrint('$stackTrace');
+
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Tracking error: $error';
+        isTracking = false;
+      });
+
     } finally {
       if (mounted) {
         setState(() {
@@ -269,23 +333,27 @@ class _TrackerScreenState extends State<TrackerScreen> {
     isSending = true;
 
     try {
-      final response = await http
-          .post(
-            Uri.parse('$apiBaseUrl/location/'),
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Boat-Device-Token': deviceToken!,
-            },
-            body: jsonEncode({
-              'latitude': position.latitude,
-              'longitude': position.longitude,
-            }),
-          )
-          .timeout(const Duration(seconds: 15));
+      debugPrint('UPLOADING LOCATION TO RENDER...');
+
+      final response = await http.post(
+        Uri.parse('$apiBaseUrl/location/'),
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Boat-Device-Token': deviceToken!,
+        },
+        body: jsonEncode({
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+        }),
+      ).timeout(const Duration(seconds: 20));
+
+      debugPrint('UPLOAD HTTP STATUS: ${response.statusCode}');
+      debugPrint('UPLOAD RESPONSE: ${response.body}');
 
       if (!mounted) return;
 
-      if (response.statusCode == 201) {
+      if (response.statusCode == 201 ||
+          response.statusCode == 200) {
         setState(() {
           successfulUploads++;
           uploadStatus = 'Location uploaded successfully';
@@ -293,10 +361,21 @@ class _TrackerScreenState extends State<TrackerScreen> {
       } else {
         setState(() {
           uploadStatus =
-              'Upload failed (${response.statusCode}): ${response.body}';
+              'Upload failed (${response.statusCode}): '
+              '${response.body}';
         });
       }
+    } on TimeoutException {
+      debugPrint('UPLOAD TIMEOUT');
+
+      if (!mounted) return;
+
+      setState(() {
+        uploadStatus = 'Server response timed out';
+      });
     } catch (error) {
+      debugPrint('UPLOAD ERROR: $error');
+
       if (!mounted) return;
 
       setState(() {
@@ -354,7 +433,9 @@ class _TrackerScreenState extends State<TrackerScreen> {
             size: 85,
             color: Color(0xFF087F8C),
           ),
+
           const SizedBox(height: 12),
+
           const Center(
             child: Text(
               'Boat GPS Control',
@@ -364,18 +445,20 @@ class _TrackerScreenState extends State<TrackerScreen> {
               ),
             ),
           ),
+
           const SizedBox(height: 24),
 
           const Text(
             'Private device token',
             style: TextStyle(fontWeight: FontWeight.bold),
           ),
+
           const SizedBox(height: 8),
 
           TextField(
             controller: tokenController,
             obscureText: true,
-            enabled: !isTracking,
+            enabled: !isTracking && !isStarting,
             decoration: const InputDecoration(
               border: OutlineInputBorder(),
               hintText: 'Enter your Render device token',
@@ -386,7 +469,8 @@ class _TrackerScreenState extends State<TrackerScreen> {
           const SizedBox(height: 10),
 
           OutlinedButton.icon(
-            onPressed: isTracking ? null : saveToken,
+            onPressed:
+                (isTracking || isStarting) ? null : saveToken,
             icon: const Icon(Icons.security),
             label: const Text('Save token securely'),
           ),
@@ -405,20 +489,28 @@ class _TrackerScreenState extends State<TrackerScreen> {
                       letterSpacing: 1.2,
                     ),
                   ),
+
                   const SizedBox(height: 12),
+
                   Icon(
-                    isTracking ? Icons.gps_fixed : Icons.gps_off,
+                    isTracking
+                        ? Icons.gps_fixed
+                        : Icons.gps_not_fixed,
                     size: 42,
                     color: isTracking
                         ? Colors.green
                         : Colors.grey,
                   ),
+
                   const SizedBox(height: 8),
+
                   Text(
                     status,
                     textAlign: TextAlign.center,
                   ),
+
                   const SizedBox(height: 8),
+
                   Text(
                     uploadStatus,
                     textAlign: TextAlign.center,
@@ -444,18 +536,24 @@ class _TrackerScreenState extends State<TrackerScreen> {
                         fontWeight: FontWeight.bold,
                       ),
                     ),
+
                     const SizedBox(height: 12),
+
+                    Text('Latitude: ${position.latitude}'),
+                    Text('Longitude: ${position.longitude}'),
+
                     Text(
-                      'Latitude: ${position.latitude}',
+                      'Accuracy: '
+                      '${position.accuracy.toStringAsFixed(1)} metres',
                     ),
+
                     Text(
-                      'Longitude: ${position.longitude}',
+                      'Speed: '
+                      '${(position.speed * 3.6).toStringAsFixed(1)} km/h',
                     ),
+
                     Text(
-                      'Accuracy: ${position.accuracy.toStringAsFixed(1)} metres',
-                    ),
-                    Text(
-                      'Speed: ${(position.speed * 3.6).toStringAsFixed(1)} km/h',
+                      'GPS time: ${position.timestamp.toLocal()}',
                     ),
                   ],
                 ),
@@ -472,8 +570,9 @@ class _TrackerScreenState extends State<TrackerScreen> {
           const SizedBox(height: 24),
 
           FilledButton.icon(
-            onPressed:
-                (isTracking || isStarting) ? null : startTracking,
+            onPressed: (isTracking || isStarting)
+                ? null
+                : startTracking,
             icon: const Icon(Icons.play_arrow),
             label: Text(
               isStarting

@@ -158,3 +158,6 @@ CORS_ALLOW_HEADERS = [
 ]
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+CORS_ALLOWED_ORIGINS = [
+    "https://arnala-boat-location-1.onrender.com",
+]
